@@ -1,0 +1,5 @@
+mysql-connector-python
+pandas
+python-dateutil
+tabulate
+prophet

@@ -1,0 +1,303 @@
+"""
+Dự báo doanh thu TOA và TOT cuối tháng
+Công thức: (Thực tế tháng hiện tại / Cùng kỳ năm trước) × Cả tháng năm trước
+ 
+Yêu cầu: pip install mysql-connector-python pandas tabulate
+"""
+ 
+import sys
+import mysql.connector
+import pandas as pd
+from datetime import date, timedelta
+from dateutil.relativedelta import relativedelta   # pip install python-dateutil
+from data_b.config import config_data_b as db_config
+ 
+# Ensure Unicode output works on Windows consoles
+for stream in (sys.stdout, sys.stderr):
+    try:
+        stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+ 
+# ─────────────────────────────────────────────
+# Cấu hình thời gian
+# ─────────────────────────────────────────────
+REFERENCE_DATE = date.today()
+TARGET_MONTH = 5
+TARGET_YEAR = REFERENCE_DATE.year if REFERENCE_DATE.month >= TARGET_MONTH else REFERENCE_DATE.year - 1
+MONTH_START = date(TARGET_YEAR, TARGET_MONTH, 1)                        # VD: 2026-05-01
+MONTH_END = (MONTH_START + relativedelta(months=1)) - timedelta(days=1)   # VD: 2026-05-31
+DAYS_PASSED = (MONTH_END - MONTH_START).days + 1                         # Số ngày trong tháng
+
+# Cùng kỳ năm trước
+PREV_YEAR_SAME_START = MONTH_START - relativedelta(years=1)              # 2025-05-01
+PREV_YEAR_SAME_END   = MONTH_END - relativedelta(years=1)                # 2025-05-31
+
+# Cả tháng năm trước (nền lịch sử)
+PREV_YEAR_FULL_START = PREV_YEAR_SAME_START
+PREV_YEAR_FULL_END   = PREV_YEAR_SAME_END
+
+print(f"📅 Tháng tính        : {MONTH_START} → {MONTH_END}  ({DAYS_PASSED} ngày)")
+ 
+# ─────────────────────────────────────────────
+# SQL queries
+# ─────────────────────────────────────────────
+ 
+# TOA thực tế tháng hiện tại
+# Rev TOA = SUM(checkin.TOAHLV) với contract không phải GYM
+SQL_TOA_CURRENT = """
+    SELECT
+        c.maCoSo,
+        SUM(c.TOAHLV) AS toa_current
+    FROM checkin c
+    JOIN contract ct ON ct.maHD = c.maHD
+    WHERE c.ngayTap BETWEEN %(start)s AND %(end)s
+      AND ct.packageType NOT LIKE '%%GYM%%'
+    GROUP BY c.maCoSo
+"""
+
+# TOA cùng kỳ năm trước (cùng số ngày)
+SQL_TOA_PREV_SAME = """
+    SELECT
+        c.maCoSo,
+        SUM(c.TOAHLV) AS toa_prev_same
+    FROM checkin c
+    JOIN contract ct ON ct.maHD = c.maHD
+    WHERE c.ngayTap BETWEEN %(start)s AND %(end)s
+      AND ct.packageType NOT LIKE '%%GYM%%'
+    GROUP BY c.maCoSo
+"""
+
+# TOA cả tháng năm trước
+SQL_TOA_PREV_FULL = """
+    SELECT
+        c.maCoSo,
+        SUM(c.TOAHLV) AS toa_prev_full
+    FROM checkin c
+    JOIN contract ct ON ct.maHD = c.maHD
+    WHERE c.ngayTap BETWEEN %(start)s AND %(end)s
+      AND ct.packageType NOT LIKE '%%GYM%%'
+    GROUP BY c.maCoSo
+"""
+ 
+# TOT thực tế tháng hiện tại
+# Rev TOT = soTienThucNop (loại hủy) + CTKMTien (đã duyệt) + PT GYM
+SQL_TOT_CURRENT = """
+    SELECT
+        p.maCoSo,
+        SUM(
+            -- Thành phần 1: tiền thực nộp, loại trừ PT bị hủy
+            CASE WHEN (tckt.xacNhanKT IS NULL OR tckt.xacNhanKT NOT LIKE '%%hủy%%')
+                 THEN p.soTienThucNop ELSE 0 END
+            +
+            -- Thành phần 2: tiền khuyến mãi đã được duyệt
+            CASE WHEN tckt.trangThaiDuyetCTKM = 'Duyệt'
+                 THEN COALESCE(tckt.CTKMTien, 0) ELSE 0 END
+        ) AS tot_current
+    FROM pt p
+    LEFT JOIN pt_tckt tckt ON tckt.maPT = p.maPT
+    WHERE p.ngayLapPT BETWEEN %(start)s AND %(end)s
+    GROUP BY p.maCoSo
+
+    UNION ALL
+
+    -- Thành phần 3: doanh thu PT GYM (bảng riêng)
+    SELECT
+        ct.maCoSo,
+        SUM(g.so_tien_thuc_te) AS tot_current
+    FROM pt_gym g
+    JOIN contract ct ON ct.maHD = g.ma_hop_dong
+    WHERE g.ngay_lap BETWEEN %(start)s AND %(end)s
+    GROUP BY ct.maCoSo
+"""
+
+# TOT cùng kỳ năm trước
+SQL_TOT_PREV_SAME = """
+    SELECT
+        p.maCoSo,
+        SUM(
+            CASE WHEN (tckt.xacNhanKT IS NULL OR tckt.xacNhanKT NOT LIKE '%%hủy%%')
+                 THEN p.soTienThucNop ELSE 0 END
+            +
+            CASE WHEN tckt.trangThaiDuyetCTKM = 'Duyệt'
+                 THEN COALESCE(tckt.CTKMTien, 0) ELSE 0 END
+        ) AS tot_prev_same
+    FROM pt p
+    LEFT JOIN pt_tckt tckt ON tckt.maPT = p.maPT
+    WHERE p.ngayLapPT BETWEEN %(start)s AND %(end)s
+    GROUP BY p.maCoSo
+
+    UNION ALL
+
+    SELECT
+        ct.maCoSo,
+        SUM(g.so_tien_thuc_te) AS tot_prev_same
+    FROM pt_gym g
+    JOIN contract ct ON ct.maHD = g.ma_hop_dong
+    WHERE g.ngay_lap BETWEEN %(start)s AND %(end)s
+    GROUP BY ct.maCoSo
+"""
+
+# TOT cả tháng năm trước
+SQL_TOT_PREV_FULL = """
+    SELECT
+        p.maCoSo,
+        SUM(
+            CASE WHEN (tckt.xacNhanKT IS NULL OR tckt.xacNhanKT NOT LIKE '%%hủy%%')
+                 THEN p.soTienThucNop ELSE 0 END
+            +
+            CASE WHEN tckt.trangThaiDuyetCTKM = 'Duyệt'
+                 THEN COALESCE(tckt.CTKMTien, 0) ELSE 0 END
+        ) AS tot_prev_full
+    FROM pt p
+    LEFT JOIN pt_tckt tckt ON tckt.maPT = p.maPT
+    WHERE p.ngayLapPT BETWEEN %(start)s AND %(end)s
+    GROUP BY p.maCoSo
+
+    UNION ALL
+
+    SELECT
+        ct.maCoSo,
+        SUM(g.so_tien_thuc_te) AS tot_prev_full
+    FROM pt_gym g
+    JOIN contract ct ON ct.maHD = g.ma_hop_dong
+    WHERE g.ngay_lap BETWEEN %(start)s AND %(end)s
+    GROUP BY ct.maCoSo
+"""
+ 
+ 
+# ─────────────────────────────────────────────
+# Hàm tiện ích
+# ─────────────────────────────────────────────
+ 
+def run_query(cursor, sql, params):
+    """Chạy query và trả về DataFrame."""
+    cursor.execute(sql, params)
+    rows = cursor.fetchall()
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
+ 
+ 
+def safe_divide(a, b):
+    """Chia an toàn — trả về NaN nếu mẫu = 0."""
+    return a / b.replace(0, float("nan"))
+ 
+ 
+def fmt_vnd(x):
+    """Format số thành triệu đồng."""
+    if pd.isna(x):
+        return "N/A"
+    return f"{x/1_000_000:,.1f} tr"
+ 
+ 
+# ─────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────
+ 
+conn = cursor = None
+ 
+try:
+    conn   = mysql.connector.connect(**db_config.config)
+    cursor = conn.cursor(dictionary=True)
+ 
+    # ── Lấy dữ liệu TOA ──────────────────────
+    df_toa_cur  = run_query(cursor, SQL_TOA_CURRENT,
+                            {"start": MONTH_START,          "end": MONTH_END})
+    df_toa_psame = run_query(cursor, SQL_TOA_PREV_SAME,
+                             {"start": PREV_YEAR_SAME_START, "end": PREV_YEAR_SAME_END})
+    df_toa_pfull = run_query(cursor, SQL_TOA_PREV_FULL,
+                             {"start": PREV_YEAR_FULL_START, "end": PREV_YEAR_FULL_END})
+ 
+    # ── Lấy dữ liệu TOT ──────────────────────
+    # Mỗi query trả về 2 khối (pt + pt_gym) → groupby lại để cộng gộp theo maCoSo
+    def run_query_grouped(cursor, sql, params, value_col):
+        df = run_query(cursor, sql, params)
+        if df.empty:
+            return df
+        return df.groupby("maCoSo", as_index=False)[value_col].sum()
+
+    df_tot_cur   = run_query_grouped(cursor, SQL_TOT_CURRENT,
+                                     {"start": MONTH_START,          "end": MONTH_END},
+                                     "tot_current")
+    df_tot_psame = run_query_grouped(cursor, SQL_TOT_PREV_SAME,
+                                     {"start": PREV_YEAR_SAME_START, "end": PREV_YEAR_SAME_END},
+                                     "tot_prev_same")
+    df_tot_pfull = run_query_grouped(cursor, SQL_TOT_PREV_FULL,
+                                     {"start": PREV_YEAR_FULL_START, "end": PREV_YEAR_FULL_END},
+                                     "tot_prev_full")
+ 
+    # ── Merge TOA ────────────────────────────
+    toa = (
+        df_toa_cur
+        .merge(df_toa_psame, on="maCoSo", how="outer")
+        .merge(df_toa_pfull, on="maCoSo", how="outer")
+        .fillna(0)
+    )
+    toa["yoy_ratio_toa"]  = safe_divide(toa["toa_current"], toa["toa_prev_same"])
+    toa["forecast_toa"]   = (toa["yoy_ratio_toa"] * toa["toa_prev_full"]).round(0)
+ 
+    # ── Merge TOT ────────────────────────────
+    tot = (
+        df_tot_cur
+        .merge(df_tot_psame, on="maCoSo", how="outer")
+        .merge(df_tot_pfull, on="maCoSo", how="outer")
+        .fillna(0)
+    )
+    tot["yoy_ratio_tot"]  = safe_divide(tot["tot_current"], tot["tot_prev_same"])
+    tot["forecast_tot"]   = (tot["yoy_ratio_tot"] * tot["tot_prev_full"]).round(0)
+ 
+    # ── Kết hợp TOA + TOT ────────────────────
+    result = toa.merge(tot, on="maCoSo", how="outer").fillna(0)
+    result["forecast_total"] = result["forecast_toa"] + result["forecast_tot"]
+ 
+    # ── Sắp xếp theo dự báo giảm dần ────────
+    result = result.sort_values("forecast_total", ascending=False).reset_index(drop=True)
+ 
+    # ── In kết quả ───────────────────────────
+    display_cols = {
+        "maCoSo"         : "Cơ sở",
+        "toa_current"    : "TOA thực tế",
+        "toa_prev_same"  : "TOA cùng kỳ",
+        "yoy_ratio_toa"  : "YoY TOA",
+        "forecast_toa"   : "Dự báo TOA",
+        "tot_current"    : "TOT thực tế",
+        "forecast_tot"   : "Dự báo TOT",
+        "forecast_total" : "Tổng dự báo",
+    }
+ 
+    out = result[list(display_cols.keys())].rename(columns=display_cols).copy()
+    for col in ["TOA thực tế", "TOA cùng kỳ", "Dự báo TOA",
+                "TOT thực tế", "Dự báo TOT", "Tổng dự báo"]:
+        out[col] = out[col].apply(fmt_vnd)
+    out["YoY TOA"] = result["yoy_ratio_toa"].apply(
+        lambda x: f"{(x-1)*100:+.1f}%" if not pd.isna(x) else "N/A"
+    )
+ 
+    print("\n📊 DỰ BÁO DOANH THU CUỐI THÁNG (theo cơ sở)")
+    print("─" * 60)
+    try:
+        from tabulate import tabulate
+        print(tabulate(out, headers="keys", tablefmt="rounded_outline", showindex=False))
+    except ImportError:
+        print(out.to_string(index=False))
+ 
+    # ── Tổng hợp toàn hệ thống ───────────────
+    total_toa   = result["forecast_toa"].sum()
+    total_tot   = result["forecast_tot"].sum()
+    total_all   = result["forecast_total"].sum()
+    print(f"\n✅ Tổng dự báo TOA : {fmt_vnd(total_toa)}")
+    print(f"✅ Tổng dự báo TOT : {fmt_vnd(total_tot)}")
+    print(f"✅ TỔNG DỰ BÁO     : {fmt_vnd(total_all)}")
+ 
+    # ── Xuất CSV ─────────────────────────────
+    output_file = f"forecast_{MONTH_START.strftime('%Y_%m')}.csv"
+    result.to_csv(output_file, index=False, encoding="utf-8-sig")
+    print(f"\n💾 Đã xuất file: {output_file}")
+ 
+except mysql.connector.Error as err:
+    print(f"❌ Lỗi MySQL: {err}")
+ 
+finally:
+    if cursor:
+        cursor.close()
+    if conn and conn.is_connected():
+        conn.close()

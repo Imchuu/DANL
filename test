@@ -1,0 +1,320 @@
+"""
+Dự báo doanh thu TOA và TOT bằng Facebook Prophet
+- Train riêng mỗi cơ sở (maCoSo) một model
+- Output: dự báo phần còn lại của tháng hiện tại + toàn bộ tháng sau
+- Yêu cầu: pip install prophet mysql-connector-python pandas python-dateutil tabulate
+"""
+ 
+import sys
+import warnings
+import mysql.connector
+import pandas as pd
+from datetime import date, timedelta
+from dateutil.relativedelta import relativedelta
+from data_b.config import config_data_b as db_config
+ 
+warnings.filterwarnings("ignore")  # tắt verbose của Prophet/Stan
+ 
+for stream in (sys.stdout, sys.stderr):
+    try:
+        stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+ 
+# ─────────────────────────────────────────────
+# Cấu hình thời gian
+# ─────────────────────────────────────────────
+TODAY           = date.today()
+MONTH_START     = TODAY.replace(day=1)
+MONTH_END       = (MONTH_START + relativedelta(months=1)) - timedelta(days=1)
+NEXT_MONTH_START = MONTH_START + relativedelta(months=1)
+NEXT_MONTH_END  = (NEXT_MONTH_START + relativedelta(months=1)) - timedelta(days=1)
+ 
+# Lấy 2 năm lịch sử để train
+HISTORY_START   = MONTH_START - relativedelta(years=2)
+HISTORY_END     = TODAY - timedelta(days=1)  # đến hôm qua (hôm nay chưa đủ ngày)
+ 
+print(f"📅 Hôm nay              : {TODAY}")
+print(f"📅 Lịch sử train        : {HISTORY_START} → {HISTORY_END}")
+print(f"📅 Dự báo tháng hiện tại: {TODAY} → {MONTH_END}")
+print(f"📅 Dự báo tháng sau     : {NEXT_MONTH_START} → {NEXT_MONTH_END}")
+print("─" * 60)
+ 
+# ─────────────────────────────────────────────
+# SQL — lấy daily revenue theo từng cơ sở
+# ─────────────────────────────────────────────
+ 
+# Daily TOA: checkin.GiaTri, loại contract GYM
+SQL_TOA_DAILY = """
+    SELECT
+        c.maCoSo,
+        DATE(c.ngayTap)       AS ds,
+        SUM(c.donGia)         AS y
+    FROM checkin c
+    JOIN contract ct ON ct.maHD = c.maHD
+    WHERE c.ngayTap BETWEEN %(start)s AND %(end)s
+      AND ct.packageType NOT LIKE '%%GYM%%'
+    GROUP BY c.maCoSo, DATE(c.ngayTap)
+    ORDER BY c.maCoSo, ds
+"""
+ 
+# Daily TOT: pt (loại hủy + CTKM đã duyệt) + pt_gym
+SQL_TOT_DAILY = """
+    SELECT
+        maCoSo,
+        DATE(ngayLapPT)  AS ds,
+        SUM(revenue) AS y
+    FROM pt
+    WHERE ngayLapPT BETWEEN %(start)s AND %(end)s
+    GROUP BY maCoSo, DATE(ngayLapPT)
+ 
+    UNION ALL
+ 
+    SELECT
+        c.maCoSo,
+        DATE(pg.ngay_lap)  AS ds,
+        SUM(pg.so_tien_thuc_te) AS y
+    FROM pt_gym pg
+    JOIN contract c ON pg.ma_hop_dong = c.maHD
+    WHERE pg.ngay_lap BETWEEN %(start)s AND %(end)s
+    GROUP BY c.maCoSo, DATE(pg.ngay_lap)
+ 
+    ORDER BY maCoSo, ds
+"""
+ 
+# Doanh thu thực tế tháng hiện tại (để cộng vào forecast intra-month)
+SQL_TOA_ACTUAL_CURRENT = """
+    SELECT
+        c.maCoSo,
+        SUM(c.donGia) AS actual_current
+    FROM checkin c
+    JOIN contract ct ON ct.maHD = c.maHD
+    WHERE c.ngayTap BETWEEN %(start)s AND %(end)s
+      AND ct.packageType NOT LIKE '%%GYM%%'
+    GROUP BY c.maCoSo
+"""
+ 
+SQL_TOT_ACTUAL_CURRENT = """
+    SELECT maCoSo,
+           SUM(revenue) AS actual_current
+    FROM pt
+    WHERE ngayLapPT BETWEEN %(start)s AND %(end)s
+    GROUP BY maCoSo
+    UNION ALL
+    SELECT c.maCoSo, SUM(pg.so_tien_thuc_te) AS actual_current
+    FROM pt_gym pg
+    JOIN contract c ON pg.ma_hop_dong = c.maHD
+    WHERE pg.ngay_lap BETWEEN %(start)s AND %(end)s
+    GROUP BY c.maCoSo
+"""
+ 
+# ─────────────────────────────────────────────
+# Hàm tiện ích
+# ─────────────────────────────────────────────
+ 
+def run_query(cursor, sql, params):
+    cursor.execute(sql, params)
+    rows = cursor.fetchall()
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
+ 
+ 
+def fmt_vnd(x):
+    if pd.isna(x) or x == 0:
+        return "N/A"
+    return f"{x / 1_000_000:,.1f} tr"
+ 
+ 
+def build_future_dates(today, month_end, next_month_end):
+    """Tạo danh sách ngày cần dự báo: hôm nay → cuối tháng sau."""
+    dates = pd.date_range(start=today, end=next_month_end, freq="D")
+    return pd.DataFrame({"ds": dates})
+ 
+ 
+def train_and_forecast(df_history, future_df, branch_id, metric_name):
+    """
+    Train Prophet trên daily history của 1 branch, forecast ra future_df.
+    Trả về DataFrame với ds + yhat (clamp về 0).
+    """
+    try:
+        from prophet import Prophet
+    except ImportError as exc:
+        raise ImportError(
+            "Missing required package 'prophet'. Install it with 'pip install prophet' "
+            "or add it to your requirements file."
+        ) from exc
+ 
+    if df_history.empty or len(df_history) < 30:
+        print(f"  ⚠️  {branch_id} [{metric_name}]: không đủ data (< 30 ngày), bỏ qua.")
+        return pd.DataFrame()
+ 
+    df = df_history[["ds", "y"]].copy()
+    df["ds"] = pd.to_datetime(df["ds"])
+    df["y"]  = df["y"].clip(lower=0)  # không cho âm
+ 
+    m = Prophet(
+        yearly_seasonality=True,
+        weekly_seasonality=True,
+        daily_seasonality=False,
+        seasonality_mode="multiplicative",  # phù hợp revenue có biến động tỷ lệ
+        interval_width=0.8,
+    )
+    m.fit(df, iter=300)  # iter=300 đủ nhanh cho daily data 2 năm
+ 
+    forecast = m.predict(future_df)
+    forecast["yhat"] = forecast["yhat"].clip(lower=0)
+    return forecast[["ds", "yhat", "yhat_lower", "yhat_upper"]]
+ 
+ 
+def aggregate_forecast(forecast_df, start_date, end_date):
+    """Cộng tổng yhat trong khoảng [start_date, end_date]."""
+    if forecast_df.empty:
+        return 0.0
+    mask = (forecast_df["ds"] >= pd.Timestamp(start_date)) & \
+           (forecast_df["ds"] <= pd.Timestamp(end_date))
+    return forecast_df.loc[mask, "yhat"].sum()
+ 
+ 
+# ─────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────
+ 
+conn = cursor = None
+ 
+try:
+    conn   = mysql.connector.connect(**db_config.config)
+    cursor = conn.cursor(dictionary=True)
+ 
+    params_history = {"start": HISTORY_START, "end": HISTORY_END}
+    params_current = {"start": MONTH_START,   "end": TODAY}
+ 
+    print("⏳ Đang tải dữ liệu lịch sử...")
+    df_toa_daily = run_query(cursor, SQL_TOA_DAILY, params_history)
+    df_tot_daily = run_query(cursor, SQL_TOT_DAILY, params_history)
+ 
+    # Gộp pt + pt_gym cho TOT daily
+    if not df_tot_daily.empty:
+        df_tot_daily = (df_tot_daily
+                        .groupby(["maCoSo", "ds"], as_index=False)["y"]
+                        .sum())
+ 
+    print("⏳ Đang tải doanh thu thực tế tháng hiện tại...")
+    df_toa_actual = run_query(cursor, SQL_TOA_ACTUAL_CURRENT, params_current)
+    df_tot_actual = run_query(cursor, SQL_TOT_ACTUAL_CURRENT, params_current)
+    if not df_tot_actual.empty:
+        df_tot_actual = df_tot_actual.groupby("maCoSo", as_index=False)["actual_current"].sum()
+ 
+    branches = sorted(set(
+        list(df_toa_daily["maCoSo"].unique() if not df_toa_daily.empty else []) +
+        list(df_tot_daily["maCoSo"].unique() if not df_tot_daily.empty else [])
+    ))
+    print(f"✅ Tìm thấy {len(branches)} cơ sở. Bắt đầu train Prophet...\n")
+ 
+    future_df = build_future_dates(TODAY, MONTH_END, NEXT_MONTH_END)
+ 
+    results = []
+ 
+    for branch in branches:
+        print(f"🔄 [{branch}]")
+ 
+        # ── TOA ──
+        hist_toa = df_toa_daily[df_toa_daily["maCoSo"] == branch] \
+                   if not df_toa_daily.empty else pd.DataFrame()
+        fc_toa   = train_and_forecast(hist_toa, future_df.copy(), branch, "TOA")
+ 
+        # ── TOT ──
+        hist_tot = df_tot_daily[df_tot_daily["maCoSo"] == branch] \
+                   if not df_tot_daily.empty else pd.DataFrame()
+        fc_tot   = train_and_forecast(hist_tot, future_df.copy(), branch, "TOT")
+ 
+        # ── Thực tế tháng hiện tại ──
+        actual_toa = 0.0
+        if not df_toa_actual.empty and branch in df_toa_actual["maCoSo"].values:
+            actual_toa = float(df_toa_actual.loc[
+                df_toa_actual["maCoSo"] == branch, "actual_current"].iloc[0])
+ 
+        actual_tot = 0.0
+        if not df_tot_actual.empty and branch in df_tot_actual["maCoSo"].values:
+            actual_tot = float(df_tot_actual.loc[
+                df_tot_actual["maCoSo"] == branch, "actual_current"].iloc[0])
+ 
+        # ── Intra-month: thực tế đã có + Prophet dự báo phần còn lại ──
+        remain_start = TODAY + timedelta(days=1)
+        remain_toa = aggregate_forecast(fc_toa, remain_start, MONTH_END)
+        remain_tot = aggregate_forecast(fc_tot, remain_start, MONTH_END)
+        intra_toa  = actual_toa + remain_toa
+        intra_tot  = actual_tot + remain_tot
+ 
+        # ── Next-month: toàn bộ Prophet ──
+        next_toa = aggregate_forecast(fc_toa, NEXT_MONTH_START, NEXT_MONTH_END)
+        next_tot = aggregate_forecast(fc_tot, NEXT_MONTH_START, NEXT_MONTH_END)
+ 
+        results.append({
+            "maCoSo"          : branch,
+            "actual_toa"      : actual_toa,
+            "actual_tot"      : actual_tot,
+            "forecast_toa_cur": intra_toa,
+            "forecast_tot_cur": intra_tot,
+            "forecast_rev_cur": intra_toa + intra_tot,
+            "forecast_toa_nxt": next_toa,
+            "forecast_tot_nxt": next_tot,
+            "forecast_rev_nxt": next_toa + next_tot,
+        })
+ 
+    df_result = pd.DataFrame(results).sort_values("forecast_rev_cur", ascending=False) \
+                                     .reset_index(drop=True)
+ 
+    # ── In kết quả ───────────────────────────
+    print(f"\n{'─'*60}")
+    print(f"📊 DỰ BÁO DOANH THU — THÁNG {MONTH_START.strftime('%m/%Y')} (đến cuối tháng)")
+    print(f"{'─'*60}")
+ 
+    out_cur = df_result[["maCoSo", "actual_toa", "actual_tot",
+                          "forecast_toa_cur", "forecast_tot_cur", "forecast_rev_cur"]].copy()
+    out_cur.columns = ["Cơ sở", "TOA thực tế", "TOT thực tế",
+                       "Dự báo TOA", "Dự báo TOT", "Tổng dự báo"]
+    for col in out_cur.columns[1:]:
+        out_cur[col] = out_cur[col].apply(fmt_vnd)
+ 
+    try:
+        from tabulate import tabulate
+        print(tabulate(out_cur, headers="keys", tablefmt="rounded_outline", showindex=False))
+    except ImportError:
+        print(out_cur.to_string(index=False))
+ 
+    print(f"\n✅ Tổng dự báo TOA tháng này : {fmt_vnd(df_result['forecast_toa_cur'].sum())}")
+    print(f"✅ Tổng dự báo TOT tháng này : {fmt_vnd(df_result['forecast_tot_cur'].sum())}")
+    print(f"✅ TỔNG DỰ BÁO THÁNG NÀY    : {fmt_vnd(df_result['forecast_rev_cur'].sum())}")
+ 
+    print(f"\n{'─'*60}")
+    print(f"📊 DỰ BÁO DOANH THU — THÁNG {NEXT_MONTH_START.strftime('%m/%Y')} (tháng sau)")
+    print(f"{'─'*60}")
+ 
+    out_nxt = df_result[["maCoSo", "forecast_toa_nxt",
+                          "forecast_tot_nxt", "forecast_rev_nxt"]].copy()
+    out_nxt.columns = ["Cơ sở", "Dự báo TOA", "Dự báo TOT", "Tổng dự báo"]
+    for col in out_nxt.columns[1:]:
+        out_nxt[col] = out_nxt[col].apply(fmt_vnd)
+ 
+    try:
+        print(tabulate(out_nxt, headers="keys", tablefmt="rounded_outline", showindex=False))
+    except ImportError:
+        print(out_nxt.to_string(index=False))
+ 
+    print(f"\n✅ Tổng dự báo TOA tháng sau : {fmt_vnd(df_result['forecast_toa_nxt'].sum())}")
+    print(f"✅ Tổng dự báo TOT tháng sau : {fmt_vnd(df_result['forecast_tot_nxt'].sum())}")
+    print(f"✅ TỔNG DỰ BÁO THÁNG SAU    : {fmt_vnd(df_result['forecast_rev_nxt'].sum())}")
+ 
+    # ── Xuất CSV ─────────────────────────────
+    output_file = f"forecast_prophet_{TODAY.strftime('%Y%m%d')}.csv"
+    df_result.to_csv(output_file, index=False, encoding="utf-8-sig")
+    print(f"\n💾 Đã xuất: {output_file}")
+ 
+except mysql.connector.Error as err:
+    print(f"❌ Lỗi MySQL: {err}")
+ 
+finally:
+    if cursor:
+        cursor.close()
+    if conn and conn.is_connected():
+        conn.close()
+ 
